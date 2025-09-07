@@ -9,8 +9,8 @@ import (
     "github.com/stretchr/testify/require"
 )
 
-// Test_PebbleOption1_LSS_HSS_Reads validates LSS/HSS correctness
-func Test_PebbleOption1_LSS_HSS_Reads(t *testing.T) {
+// Test_DualTimelinePebble_LSS_HSS_Reads validates LSS/HSS correctness
+func Test_DualTimelinePebble_LSS_HSS_Reads(t *testing.T) {
     db, err := pebble.Open("", &pebble.Options{FS: vfs.NewMem(), DisableWAL: true})
     require.NoError(t, err)
     defer db.Close()
@@ -57,12 +57,12 @@ func Test_PebbleOption1_LSS_HSS_Reads(t *testing.T) {
     t.Logf("✓ LSS/HSS reads working correctly")
 }
 
-// Benchmark_Option1_vs_Issue196 compares Option 1 performance against versioned approach
-func Benchmark_Option1_vs_Issue196(b *testing.B) {
+// Benchmark_DualTimelinePebble_vs_Issue196 compares Dual Timeline Pebble performance against versioned approach
+func Benchmark_DualTimelinePebble_vs_Issue196(b *testing.B) {
     const numKeys = 200_000
     const numVers = 4
 
-    // Pebble in-mem for Option 1
+    // Pebble in-mem for Dual Timeline Pebble
     db, err := pebble.Open("", &pebble.Options{FS: vfs.NewMem(), DisableWAL: true})
     if err != nil {
         b.Fatalf("open pebble: %v", err)
@@ -75,7 +75,7 @@ func Benchmark_Option1_vs_Issue196(b *testing.B) {
         keys[i] = []byte(fmt.Sprintf("key-%06d", i))
     }
 
-    // Populate Option 1 layout: s/<key> latest, h/<H>/<key> historical
+    // Populate Dual Timeline Pebble layout: s/<key> latest, h/<H>/<key> historical
     for h := 1; h <= numVers; h++ {
         batch := db.NewBatch()
         for _, k := range keys {
@@ -118,7 +118,7 @@ func Benchmark_Option1_vs_Issue196(b *testing.B) {
         // Ensure sample does not exceed total keys
         if sample > numKeys { sample = numKeys }
 
-        b.Run(fmt.Sprintf("Option1-Latest-Iter/%d", sample), func(b *testing.B) {
+        b.Run(fmt.Sprintf("DualTimelinePebble-Latest-Iter/%d", sample), func(b *testing.B) {
             b.ReportAllocs()
             for i := 0; i < b.N; i++ {
                 it, _ := db.NewIter(&pebble.IterOptions{LowerBound: []byte("s/"), UpperBound: []byte("t/")})
@@ -139,7 +139,7 @@ func Benchmark_Option1_vs_Issue196(b *testing.B) {
             }
         })
 
-        b.Run(fmt.Sprintf("Option1-Historical-Iter/%d", sample), func(b *testing.B) {
+        b.Run(fmt.Sprintf("DualTimelinePebble-Historical-Iter/%d", sample), func(b *testing.B) {
             b.ReportAllocs()
             H := uint64(numVers - 1)
             for i := 0; i < b.N; i++ {
@@ -162,21 +162,38 @@ func Benchmark_Option1_vs_Issue196(b *testing.B) {
             }
         })
 
-        b.Run(fmt.Sprintf("Issue196-Latest-SeekLT/%d", sample), func(b *testing.B) {
+        b.Run(fmt.Sprintf("SeekLTPebble-Latest-SeekLT/%d", sample), func(b *testing.B) {
             b.ReportAllocs()
+            
+            // Create SeekLT Pebble versioned store for this benchmark
+            seekltStore, err := NewSeekLTPebbleStore("", uint64(numVers))
+            if err != nil {
+                b.Fatal(err)
+            }
+            defer seekltStore.Close()
+            
+            // Populate SeekLT store with the same data
+            for v := 1; v <= numVers; v++ {
+                seekltStore.version = uint64(v)
+                for _, k := range keys {
+                    val := fmt.Sprintf("value-%d-%s", v, string(k))
+                    seekltStore.Set(k, []byte(val))
+                }
+                seekltStore.Commit()
+            }
+            
+            // Reset to latest version for reads
+            seekltStore.version = uint64(numVers)
+            
             for i := 0; i < b.N; i++ {
-                it, _ := db2.NewIter(&pebble.IterOptions{})
                 cnt := 0
-                // Seek to latest version for each logical key in the sample
+                // Use SeekLT Get method which uses SeekLT internally
                 for _, k := range keys[:sample] {
-                    vkey := versionedKey(k, uint64(numVers+1), false)
-                    if it.SeekLT(vkey) && it.Valid() {
-                        _ = it.Key()
-                        _ = it.Value()
+                    val, err := seekltStore.Get(k)
+                    if err == nil && val != nil {
                         cnt++
                     }
                 }
-                it.Close()
                 if cnt != sample {
                     b.Fatalf("unexpected sample count: %d", cnt)
                 }
